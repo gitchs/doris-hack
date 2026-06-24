@@ -1,0 +1,1979 @@
+#+TITLE: Doris Nereids Optimizer — All Optimization Rules (Detailed)
+#+AUTHOR: Generated from fe/fe-core/src/main/java/org/apache/doris/nereids/
+#+DATE: 2026-06-23
+
+* Directory Structure
+
+  nereids/
+  ├── analyzer/               # Semantic analysis entry
+  ├── rules/
+  │   ├── Rule.java            # Rule interface: binds PatternMatcher + transform to RuleType
+  │   ├── RuleType.java        # Enum of all ~600 rule types, each with a RuleTypeClass
+  │   ├── RuleSet.java         # Pre-built rule collections for different optimizer phases
+  │   ├── analysis/            # Binding, normalization, check (pre-optimization)
+  │   ├── rewrite/             # Heuristic (RBO) rewrite rules — fixed-point loop in batches
+  │   ├── exploration/         # CBO exploration (join-reorder, MV matching, eager agg)
+  │   │   ├── join/            # Join reorder rules (commute, assoc, lasscom, exchange)
+  │   │   └── mv/              # Materialized view rewrite + rollup handlers
+  │   ├── expression/          # Expression-level rewrites (fold-const, simplify, partition prune…)
+  │   │   ├── rules/           # Concrete expression rules
+  │   │   └── check/           # Expression validation
+  │   └── implementation/      # Logical → Physical plan translation
+  ├── pattern/                 # Pattern matching engine
+  ├── memo/                    # Cascades memo (group/group-expression)
+  ├── cost/                    # Cost model
+  ├── stats/                   # Statistics derivation
+  ├── properties/              # Physical properties (distribution, ordering…)
+  ├── trees/                   # Plan/expression tree nodes
+  ├── types/                   # Data types
+  ├── hint/                    # Hint handling
+  ├── jobs/                    # Cascades job scheduler
+  └── util/                    # Utilities
+
+* Rule Type Classification
+  Every rule has a unique =RuleType= enum entry belonging to one of these classes:
+
+  | RuleTypeClass      | Description                              |
+  |--------------------+------------------------------------------|
+  | REWRITE            | Heuristic / RBO rewrite                  |
+  | EXPLORATION        | CBO exploration (join order, eager agg)  |
+  | IMPLEMENTATION     | Logical → Physical translation           |
+  | MATERIALIZE_VIEW   | Materialized view matching               |
+  | CHECK              | Analysis-time validation                 |
+  | VALIDATION         | Permission check                         |
+  | SENTINEL           | Boundary marker                          |
+
+* Analysis Rules
+  Analysis runs before any optimization. It binds unresolved relations/expressions to catalog
+  objects, normalizes plan shapes, and performs semantic checks.
+
+** Relation Collection & Binding
+
+*** BindRelation (BINDING_RELATION)
+    Binds an UnboundRelation to the physical catalog table by resolving the table name against
+    the database catalog. Handles views (recursively expands them), CTEs, external tables,
+    and table aliases.
+
+*** BindExpression (BINDING_*_SLOT)
+    Resolves unbound expressions — UnboundSlot (column references), UnboundFunction (function
+    calls), and UnboundStar (SELECT *) — against available scopes, binding them to concrete
+    catalog columns and overloaded functions. Separate rules exist for project, filter,
+    aggregate, join, sort, having, repeat, generate, set-operation, inline-table,
+    subquery-alias, and one-row-relation slots.
+
+*** BindSink (BINDING_INSERT_*)
+    Binds unbound table sinks (INSERT target tables) by resolving the target table name and
+    matching input column schemas to table columns. Handles generated columns, auto-fills
+    missing partition columns. Separate rules for OLAP, Hive, Iceberg, MaxCompute, JDBC,
+    Connector, Dictionary, TVF, File, and Blackhole sinks. Also handles Iceberg DELETE/MERGE
+    sink output binding.
+
+*** CollectRelation (COLLECT_TABLE_FROM_*)
+    Bottom-up collection of all relations from a plan tree. Binds UnboundRelation nodes to
+    catalog objects, resolves views and CTEs recursively, and collects MTMV candidates.
+    Separate rules collect from CTEs, sinks, and other sources.
+
+*** CollectOneLevelRelation
+    Collects only immediate one-level relations without recursive view expansion or MTMV
+    collection. Used when full expansion is not desired.
+
+*** CollectSubQueryAlias (COLLECT_SUB_QUERY_ALIAS)
+    Collects subquery alias names and relation IDs for the LEADING hint, registering them
+    in the hint's relation-to-table-name mapping.
+
+*** AnalyzeCTE (ANALYZE_CTE)
+    Registers CTE definitions, checks for duplicate names, analyzes each CTE body, and
+    stores the analyzed plans in the CTE context. Eliminates the LogicalCTE node after
+    registration.
+
+*** PreloadExternalMetadata (PRELOAD_EXTERNAL_METADATA)
+    Preloads external table metadata (e.g., Hive partition information) after relation
+    collection but before internal table locks are acquired. This avoids holding locks
+    during potentially slow external metadata fetches.
+
+** Slot & Expression Binding Details
+
+*** BindSkewExpr (BINDING_SKEW_EXPR)
+    Binds skew hint expressions in join distribute hints by resolving unbound slots
+    against the join's children.
+
+*** ArithmeticFunctionBinder
+    Maps arithmetic function names (add, subtract, multiply, divide, mod, bitand, etc.)
+    to their corresponding expression types. Utility used during function resolution.
+
+*** DatetimeFunctionBinder
+    Maps datetime function names to their expression types. Utility for function resolution.
+
+*** GetFormatFunctionBinder
+    Binds the GET_FORMAT function, parsing its first argument as a string literal
+    (DATE/DATETIME/TIME) to construct the bound GetFormat expression.
+
+** Shape Normalization
+
+*** NormalizeAggregate (NORMALIZE_AGGREGATE)
+    Normalizes aggregate group-by keys and aggregate function arguments into SlotReferences,
+    adding a LogicalProject on top to preserve original output column order and names.
+
+*** NormalizeSort (NORMALIZE_SORT)
+    Materializes non-slot order key expressions into slots by adding a bottom LogicalProject
+    (to compute the expressions), then adds a top LogicalProject for output column pruning.
+
+*** NormalizeRepeat (NORMALIZE_REPEAT)
+    Normalizes a LogicalRepeat by adding virtual grouping slots and a GROUPING_ID,
+    converting it into a LogicalAggregate wrapping the original LogicalRepeat.
+
+*** NormalizeGenerate (NORMALIZE_GENERATE)
+    Extracts subquery expressions from table-generating functions (explode, lateral view)
+    into a child LogicalProject, replacing the subquery in the generator with a simple
+    slot reference.
+
+*** CompressedMaterialize (COMPRESSED_MATERIALIZE_AGG/SORT/REPEAT)
+    Encodes short string columns (varchar) as integers during aggregation and sorting to
+    improve performance by reducing memory usage and comparison cost. Corresponding decode
+    operations are added at the output. Also includes PUSH_DOWN_ENCODE_SLOT,
+    DECOUPLE_DECODE_ENCODE_SLOT, and SIMPLIFY_ENCODE_DECODE for pushing encode/decode
+    through the plan and eliminating redundant encode-decode pairs.
+
+** Fill-Up Missing Slots
+    When an operator's output is pruned to exactly what its parent needs, some internally
+    required slots may be missing. These rules add them back:
+
+*** FillUpMissingSlots (FILL_UP_*)
+    Fills up missing slots for Having, Sort, and Qualify nodes:
+    - FILL_UP_HAVING_AGGREGATE/PROJECT: Adding aggregate/project output slots needed by HAVING
+    - FILL_UP_SORT_AGGREGATE/AGGREGATE_AGGREGATE/HAVING_AGGREGATE/HAVING_PROJECT/PROJECT
+    - FILL_UP_QUALIFY_PROJECT/AGGREGATE/HAVING_AGGREGATE/HAVING_PROJECT
+
+*** FillUpQualifyMissingSlot
+    Specialized variant for QUALIFY clauses which need access to both window function
+    results and aggregate outputs.
+
+** Plan Shape Transformation
+
+*** LogicalSubQueryAliasToLogicalProject
+    Converts LogicalSubQueryAlias into a LogicalProject that preserves the alias's output
+    columns. Also sets table alias on LogicalCatalogRelation children, ensuring correct
+    column qualification in error messages.
+
+*** OneRowRelationToProject (ONE_ROW_RELATION_TO_PROJECT)
+    Converts a LogicalOneRowRelation (representing `SELECT <constants>`) into a
+    LogicalProject node, normalizing the representation.
+
+*** ProjectToGlobalAggregate (PROJECT_TO_GLOBAL_AGGREGATE)
+    Converts SELECT without FROM (project on a one-row-relation) into a global
+    aggregate (aggregate without GROUP BY), which is the canonical Doris representation.
+
+*** OneRowRelationExtractAggregate
+    Extracts aggregate functions from a OneRowRelation's expressions into a separate
+    LogicalAggregate above the OneRowRelation, normalizing the plan structure.
+
+*** ProjectWithDistinctToAggregate
+    Converts SELECT DISTINCT (a LogicalProject with DISTINCT flag) into a
+    LogicalAggregate with GROUP BY on all project columns, normalizing DISTINCT
+    to its canonical aggregate form.
+
+*** HavingToFilter (HAVING_TO_FILTER)
+    Converts a LogicalHaving node into a LogicalFilter above a LogicalAggregate,
+    normalizing HAVING to the canonical filter-above-aggregate form.
+
+*** QualifyToFilter (QUALIFY_TO_FILTER)
+    Converts a LogicalQualify node (window-function filtering) into a LogicalFilter
+    above a LogicalWindow, normalizing QUALIFY to the canonical form.
+
+*** LogicalInlineTableToLogicalUnionOrOneRowRelation
+    Converts an inline table (VALUES clause) into either a LogicalUnion (for multiple rows)
+    or a LogicalOneRowRelation (for a single row).
+
+*** AvgDistinctToSumDivCount (AVG_DISTINCT_TO_SUM_DIV_COUNT)
+    Rewrites AVG(DISTINCT col) into SUM(DISTINCT col) / COUNT(DISTINCT col), normalizing
+    distinct averages to their canonical form.
+
+** Literal & Constant Rewrites
+
+*** CountLiteralRewrite (COUNT_LITERAL_REWRITE)
+    Rewrites count(1) to count(*) (simpler execution) and count(null) to the constant 0
+    (constant folding at plan time).
+
+*** SumLiteralRewrite (SUM_LITERAL_REWRITE)
+    Rewrites sum(expr +/- literal) into sum(expr) +/- literal * count(expr) to reduce
+    computation by moving the constant outside the aggregate.
+
+*** RewriteSimpleAggToConstant (REWRITE_SIMPLE_AGG_TO_CONSTANT)
+    Rewrites simple count/min/max aggregates on DUP_KEYS olap tables (without GROUP BY)
+    to FE-side constants using table metadata (row count, min/max column value),
+    completely bypassing BE execution.
+
+** Window Function Analysis
+
+*** ExtractAndNormalizeWindowExpression
+    Extracts window expressions from a LogicalProject and normalizes them into a separate
+    LogicalWindow node, handling partition keys, order keys, and window frames. Ensures
+    each window function has a properly specified frame.
+
+*** DistinctWindowExpression
+    Rewrites count(distinct A) over(...) to multi_distinct_count(A) over(...) and similarly
+    for sum/group_concat in window contexts, enabling more efficient window computation.
+
+*** SimplifyWindowExpression
+    Simplifies window functions with unique-key partitioning: count(non-null) → 1,
+    rank/dense_rank/row_number → 1, min/max/sum/avg/first_value/last_value → the
+    argument slot itself, since unique partitioning means only one row per partition.
+
+*** CheckAndStandardizeWindowFunctionAndFrame
+    Validates window function syntax and semantics (e.g., function suitability for
+    windowing, proper frame specification). Standardizes the window frame so every
+    window has a non-null frame, filling in defaults where needed.
+
+*** CreatePartitionTopNForWindow (CREATE_PARTITION_TOPN_FOR_WINDOW)
+    Creates a PartitionTopN node below a LogicalWindow when the window function requires
+    ordering within partitions, enabling early per-partition row pruning.
+
+** MATCH / SEARCH / SCORE (Fulltext & Vector Search)
+
+*** CheckMatchExpression (CHECK_MATCH_EXPRESSION)
+    Validates that MATCH() expressions only have a SlotReference on the left side and a
+    Literal on the right. Rejects variant root columns in MATCH.
+
+*** RewriteSearchToSlots (REWRITE_SEARCH_TO_SLOTS)
+    Rewrites the search() function in filter expressions to add proper slot reference
+    children, which is crucial for BE's "action on slot" detection during execution.
+
+*** CheckSearchUsage (CHECK_SEARCH_USAGE)
+    Validates that search() expressions only appear in WHERE filters on single-table
+    OLAP scans, rejecting them in GROUP BY, aggregate output, project lists, and joins.
+
+*** CheckScoreUsage (CHECK_SCORE_USAGE)
+    Validates that score() function is only used in contexts with MATCH, ORDER BY, and
+    LIMIT for proper inverted-index optimization.
+
+** Constant & Hint Elimination (Analysis Phase)
+
+*** EliminateDistinctConstant (ELIMINATE_DISTINCT_CONSTANT)
+    Converts SELECT DISTINCT 1, 2, 3 FROM t into SELECT 1, 2, 3 FROM (SELECT 1, 2, 3
+    FROM t LIMIT 1) since the distinct is redundant when all expressions are constants.
+
+*** EliminateLogicalSelectHint (ELIMINATE_LOGICAL_SELECT_HINT)
+    Processes and removes SELECT hint nodes (SET_VAR, LEADING, ORDERED, USE_CBO_RULE,
+    USE_MV), applying each hint's effect to the cascades/statement context.
+
+*** EliminateLogicalPreAggOnHint (ELIMINATE_LOGICAL_PRE_AGG_ON_HINT)
+    Processes and removes the PRE_AGG_ON hint node, setting a flag to force
+    pre-aggregation on the statement context.
+
+*** EliminateGroupByConstant (ELIMINATE_GROUP_BY_CONSTANT)
+    Detects GROUP BY on constant expressions and eliminates them since grouping
+    by a constant is always a single group.
+
+** View & Subquery Handling
+
+*** InlineLogicalView (INLINE_VIEW)
+    Inlines a LogicalView by replacing it with its child plan — performs view expansion
+    by substituting the view definition into the query tree.
+
+*** SubqueryToApply (FILTER_SUBQUERY_TO_APPLY, PROJECT_SUBQUERY_TO_APPLY, etc.)
+    Converts subquery expressions (scalar, IN, EXISTS) in filter conjuncts, project
+    expressions, and join conditions into LogicalApply nodes. Splits correlated and
+    uncorrelated subqueries, replacing the subquery expression with a slot reference
+    to the apply result.
+
+** Subquery Decorrelation (Apply → Join)
+
+*** ScalarApplyToJoin (SCALAR_APPLY_TO_JOIN)
+    Converts scalar subquery apply nodes to joins: uncorrelated scalar subqueries become
+    CROSS_JOIN + AssertNumRows; correlated scalar subqueries become LEFT_OUTER_JOIN.
+
+*** InApplyToJoin (IN_APPLY_TO_JOIN)
+    Converts IN subquery apply nodes to joins: IN → LEFT_SEMI_JOIN, NOT IN →
+    NULL_AWARE_LEFT_ANTI_JOIN. Handles bitmap-optimized IN via BitmapUnion.
+
+*** ExistsApplyToJoin (EXISTS_APPLY_TO_JOIN)
+    Converts EXISTS apply nodes to joins: correlated EXISTS → LEFT_SEMI_JOIN, correlated
+    NOT EXISTS → LEFT_ANTI_JOIN, uncorrelated EXISTS → CROSS_JOIN with limit/aggregate.
+
+*** UnCorrelatedApplyFilter (UN_CORRELATED_APPLY_FILTER)
+    Splits correlated and uncorrelated predicates in apply-filter patterns, raising the
+    correlated predicate above the apply as a correlation filter.
+
+*** UnCorrelatedApplyProjectFilter
+    Adjusts the order of Project and apply in correlated subqueries, moving correlated
+    filter predicates above the apply node.
+
+*** UnCorrelatedApplyAggregateFilter
+    Merges correlated predicates from under an aggregate into the aggregate's group-by
+    columns, keeping uncorrelated predicates under the aggregate.
+
+*** AggScalarSubQueryToWindowFunction
+    Attempts to convert aggregate scalar subqueries (e.g., SELECT sum(x) FROM t2 WHERE
+    t2.id = t1.id) into window functions for more efficient execution.
+
+*** PullUpCorrelatedFilterUnderApplyAggregateProject
+    Swaps the order of project and correlated filter under an aggregate in correlated
+    subqueries, pulling the correlated filter above the project for better decorrelation.
+
+*** EliminateLimitUnderApply (ELIMINATE_LIMIT_UNDER_APPLY)
+    Removes LIMIT nodes under correlated apply since correlated subqueries do not
+    preserve limit semantics. Preserves limit for uncorrelated apply.
+
+*** EliminateSortUnderApply (ELIMINATE_SORT_UNDER_APPLY)
+    Removes unnecessary SORT nodes under apply and apply-project patterns in
+    subquery decorrelation, since ordering inside a subquery has no effect.
+
+*** PullUpProjectUnderApply (PULL_UP_PROJECT_UNDER_APPLY)
+    Pulls a LogicalProject above a correlated LogicalApply so the apply's right child
+    is reduced and output columns remain correct.
+
+*** PullUpProjectUnderLimit (PULL_UP_PROJECT_UNDER_LIMIT)
+    Pulls a LogicalProject above a LogicalLimit (when above a join) to enable better
+    column pruning for join pushdown optimizations.
+
+*** PullUpProjectUnderTopN (PULL_UP_PROJECT_UNDER_TOPN)
+    Pulls a LogicalProject above a LogicalTopN (when above a join) to enable TopN
+    pushdown through joins.
+
+** Semantic Checks
+
+*** CheckAnalysis (CHECK_ANALYSIS)
+    Validates semantic correctness: checks for unexpected expression types in each plan
+    node (e.g., aggregate functions in filters, table-generating functions in aggregates)
+    and verifies expression input data type compatibility.
+
+*** CheckAfterRewrite (CHECK_AFTER_REWRITE)
+    Post-rewrite validation: verifies all input slots come from children, no unexpected
+    expression types appear in wrong plan nodes, metric/variant types are not used in
+    group-by/join/sort, and MATCH is only used on olapScan filters.
+
+*** CheckDataTypes (CHECK_DATA_TYPES)
+    Validates that no unsupported data types appear anywhere in the plan tree.
+
+*** CheckRestorePartition (CHECK_RESTORE_PARTITION)
+    Checks that no selected partitions are in RESTORE state and throws an AnalysisException
+    if any are, preventing queries on partitions being restored.
+
+*** CheckPolicy (CHECK_ROW_POLICY)
+    Applies row-level security policies by injecting filter predicates from the catalog
+    for authorized tables. Substitutes the LogicalCheckPolicy node with the policy filter.
+
+*** CheckMultiDistinct
+    Validates that aggregate functions with multi-distinct can be handled by the system,
+    reporting an error if the configuration does not support the required strategy.
+
+*** UserAuthentication (RELATION_AUTHENTICATION)
+    Validates that the current user has SELECT/INSERT privileges for all tables and
+    views referenced in the plan. The only rule with VALIDATION type class.
+
+** Other Analysis Rules
+
+*** LeadingJoin (LEADING_JOIN)
+    Replaces the original join tree with the join order specified by the LEADING hint,
+    generating the hinted join plan from the hint's internal representation.
+
+*** CollectJoinConstraint (COLLECT_JOIN_CONSTRAINT)
+    Collects join condition constraints and builds bitmaps for each join node when a
+    LEADING hint is active, enabling hint-driven join order enforcement.
+
+*** ReplaceExpressionByChildOutput (REPLACE_SORT_EXPRESSION_BY_CHILD_OUTPUT)
+    Replaces sort expression keys with slot references from the child's output aliases
+    when the sort is above a project or aggregate — avoids recomputing expressions.
+
+*** AddDefaultLimit (ADD_DEFAULT_LIMIT)
+    Adds a LogicalLimit node at the top of the plan tree if the sql_select_limit session
+    variable is set, enforcing a default row limit on queries.
+
+*** ResolveOrdinalInOrderBy / ResolveOrdinalInGroupBy
+    Resolves ordinal position references (e.g., ORDER BY 1, GROUP BY 2) to actual
+    column references from the SELECT list, per SQL standard.
+
+*** AdjustNullableForSortSlot / AdjustNullableForHavingSlot
+    Adjusts the nullable property of slots used in sort and having expressions
+    after structure-changing plan rewrites.
+
+*** FoldConstantForSqlCache (FOLD_CONSTANT_FOR_SQL_CACHE)
+    Folds constant expressions and tracks nondeterministic function foldings for
+    SQL cache computation, enabling cache key generation.
+
+*** SessionVarGuardRewriter
+    Adds session variable guard wrappers to expressions that need protection against
+    session variable changes during execution.
+
+*** VariableToLiteral
+    Rewrites session variable references (e.g., @@session.time_zone) in expressions
+    to their current literal values for constant folding.
+
+*** AdjustAggregateNullableForEmptySet
+    When an aggregate has an empty group-by list, marks NullableAggregateFunction
+    expressions in having/sort as always nullable.
+
+*** EliminateOrderByConstant (ELIMINATE_ORDER_BY_CONSTANT)
+    Removes ORDER BY clauses that only contain constant expressions, and eliminates
+    the entire sort if no non-constant keys remain, since constant sorting is a no-op.
+
+*** EliminateSortUnderSubqueryOrView
+    Eliminates redundant SORT nodes that are direct children of subquery aliases or
+    views, since ordering is not meaningful within a subquery — only the outermost
+    ORDER BY matters.
+
+*** NormalizeOlapTableStreamScan
+    Normalizes stream scan parameters for OLAP table stream scans, used during
+    schema change operations to ensure correct column mapping.
+
+*** ExpressionAnalyzer
+    Core expression analysis: resolves UnboundFunction (catalog lookup, type coercion,
+    overloading), UnboundSlot (scope resolution), UnboundStar (expand to columns),
+    and UnboundVariable. The workhorse behind most of the BINDING_* rules.
+
+*** AddInitMaterializationHook
+    Adds materialized view initialization hooks (for query, insert, and CTAS operations)
+    onto the statement context so MV matching runs at the right time.
+
+* Rewrite Rules (RBO)
+  These rules run in a fixed-point loop across multiple batches. Each batch has a
+  specific optimization purpose and runs rules in a defined order.
+
+** Expression Rewrite on Plan Nodes
+   These rules apply expression-level rewrites (constant folding, simplification,
+   predicate normalization) to each plan node type:
+
+*** REWRITE_PROJECT_EXPRESSION
+    Rewrites expressions inside LogicalProject nodes: constant folding, simplification,
+    and normalization.
+
+*** REWRITE_AGG_EXPRESSION
+    Rewrites expressions inside LogicalAggregate nodes. Also triggers AGGREGATE_DISASSEMBLE
+    (splitting complex aggregates), SIMPLIFY_AGG_GROUP_BY (simplifying group-by keys),
+    and DISTINCT_AGGREGATE_DISASSEMBLE (splitting distinct aggregates).
+
+*** REWRITE_FILTER_EXPRESSION
+    Rewrites expressions inside LogicalFilter nodes: constant folding, predicate
+    simplification, normalization of comparisons.
+
+*** REWRITE_JOIN_EXPRESSION
+    Rewrites expressions inside LogicalJoin nodes. Also triggers JOIN_EXTRACT_OR_FROM_CASE_WHEN
+    (extracting OR conditions from CASE WHEN in joins), EXTRACT_FILTER_FROM_JOIN (moving
+    filter predicates out of join conditions), and FIND_HASH_CONDITION_FOR_JOIN (identifying
+    equi-join conditions usable for hash joins).
+
+*** REWRITE_SORT_EXPRESSION / REWRITE_HAVING_EXPRESSION / REWRITE_REPEAT_EXPRESSION
+    Rewrites expressions inside LogicalSort, LogicalHaving, and LogicalRepeat nodes.
+
+*** REWRITE_WINDOW_EXPRESSION / REWRITE_SET_OPERATION_EXPRESSION
+    Rewrites expressions inside LogicalWindow and LogicalSetOperation nodes.
+
+*** REWRITE_PARTITION_TOPN_EXPRESSION / REWRITE_QUALIFY_EXPRESSION / REWRITE_TOPN_EXPRESSION
+    Rewrites expressions inside LogicalPartitionTopN, LogicalQualify, and LogicalTopN nodes.
+
+*** REWRITE_OLAP_TABLE_SINK_EXPRESSION / REWRITE_SINK_EXPRESSION
+    Rewrites expressions in OLAP table sink and general sink nodes for INSERT operations.
+
+*** REWRITE_GENERATE_EXPRESSION
+    Rewrites expressions inside LogicalGenerate (lateral view / explode) nodes.
+
+*** REWRITE_LOAD_PROJECT_FOR_STREAM_LOAD
+    Rewrites project expressions specifically for stream load scenarios.
+
+*** ADD_POST_FILTER_FOR_LOAD / ADD_POST_PROJECT_FOR_LOAD
+    Adds post-filter and post-project nodes for load operations to handle generated
+    columns and default value expressions.
+
+** Predicate Pushdown
+
+*** PushDownJoinOtherCondition (PUSH_DOWN_JOIN_OTHER_CONDITION)
+    Pushes non-hash join conditions (other join conjuncts) that reference only one
+    side of a join down into that side as a filter, for applicable join types.
+    Reduces rows before the join.
+
+*** PushDownExpressionsInHashCondition (PUSH_DOWN_EXPRESSIONS_IN_HASH_CONDITIONS)
+    Wraps complex expressions (non-slot references) in hash/join equality conditions
+    with projects on each join child, so the hash join only compares simple slot references.
+    Simplifies hash join execution.
+
+*** PushDownFilterThroughJoin (PUSH_DOWN_FILTER_THROUGH_JOIN)
+    Pushes predicates from a filter above a join down to the join's left/right children
+    (or into the join's ON clause), based on which child's output each predicate references
+    and the join type (inner/left/right/full outer/semi/anti).
+
+*** PushDownFilterThroughLeftSemiJoin
+    Specialized variant for pushing filters through LEFT SEMI joins where the filter
+    references only the left child's columns.
+
+*** PushFilterInsideJoin (PUSH_FILTER_INSIDE_JOIN)
+    Merges filter predicates (that do not contain volatile expressions or mark-join slots)
+    into an inner/cross join's other join conjuncts, combining them with any existing
+    other conditions to simplify the plan.
+
+*** PushDownFilterThroughProject (PUSH_DOWN_FILTER_THROUGH_PROJECT)
+    Pushes filter predicates below a project node by rewriting the predicate expressions
+    using the project's alias-to-producer mapping. Only predicates referencing child
+    output slots are pushed down.
+
+*** PushDownFilterThroughProjectUnderLimit
+    Variant that pushes filters through projects even when a LIMIT sits above the filter,
+    accounting for limit semantics.
+
+*** PushDownFilterThroughWindow (PUSH_DOWN_FILTER_THROUGH_WINDOW)
+    Pushes filter predicates that reference only the window's partition keys below the
+    window node, so filtering happens before the window function is evaluated.
+
+*** PushDownFilterThroughPartitionTopN
+    Pushes filter predicates that reference only partition keys of a PartitionTopN below
+    the PartitionTopN, so base rows are filtered before the per-partition top-N selection.
+    Volatile expressions are blocked.
+
+*** PushDownFilterThroughSort (PUSH_DOWN_FILTER_THROUGH_SORT)
+    Pushes a filter below a sort node. The sort is always preserved; if its input slots
+    are all literal-constrained, the sort is eliminated entirely.
+
+*** PushDownFilterThroughSetOperation (PUSH_DOWN_FILTER_THROUGH_SET_OPERATION)
+    Translates each filter conjunct into each child's output column space and pushes it
+    down into every child of a set operation (UNION ALL, INTERSECT, EXCEPT). Volatile
+    expressions are blocked for non-UNION-ALL operators to preserve correct semantics.
+
+*** PushDownFilterThroughGenerate (PUSH_DOWN_FILTER_THROUGH_GENERATE)
+    Pushes filter predicates whose slots are all produced by the generate's child below
+    the generate node, keeping predicates referencing generated columns above.
+
+*** PushDownFilterThroughAggregation (PUSH_DOWN_PREDICATE_THROUGH_AGGREGATION)
+    Pushes predicates whose referenced slots are in the GROUP BY keys below the aggregate,
+    so filtering happens before aggregation. Predicates referencing non-grouped columns
+    (aggregate results) stay above.
+
+*** PushDownFilterThroughRepeat (PUSH_DOWN_PREDICATE_THROUGH_REPEAT)
+    Pushes predicates whose referenced slots are in the common grouping set expressions
+    of a LogicalRepeat below the repeat node.
+
+*** PushDownFilterThroughCTE / PushDownFilterThroughCTEAnchor
+    Pushes filter predicates into CTE producers through CTE consumers, enabling
+    predicate pushdown across CTE boundaries.
+
+*** MaxMinFilterPushDown (PUSH_DOWN_MAX_MIN_FILTER)
+    Converts HAVING max(a) > 10 or HAVING min(a) < 10 on a grouped aggregation into
+    WHERE a > 10 or WHERE a < 10 below the aggregate, when the aggregate has exactly
+    one aggregate function (max or min). Dramatically reduces rows before aggregation.
+
+** Project Pushdown & Column Pruning
+
+*** ColumnPruning (COLUMN_PRUNING)
+    Prunes unused output columns from plan nodes that implement OutputPrunable, and inserts
+    project nodes where pruning is not directly supported. This is the core column pruning
+    pass that reduces columns carried through the plan.
+
+*** NestedColumnPruning (NESTED_COLUMN_PRUNING)
+    Prunes unused sub-fields of struct, map, array, and variant columns (nested data types)
+    by analyzing access paths (e.g., col.field.subfield) and shrinking the data type to
+    only the accessed sub-paths, reducing I/O for complex types.
+
+*** VariantSubPathPruning (VARIANT_SUB_PATH_PRUNING)
+    Prunes unused sub-paths of variant-type columns by collecting all accessed sub-path
+    expressions (like v.a.b) and computing the minimal set of sub-paths needed from storage.
+
+*** PushDownProject (PUSH_DOWN_PROJECT_THROUGH_*)
+    Pushes projection expressions down through joins, windows, partition top-N, union-all,
+    and aggregates when the expressions implement PreferPushDownProject, reducing
+    computation closer to the data source.
+
+*** PushDownProjectThroughLimit (PUSH_DOWN_PROJECT_THROUGH_LIMIT)
+    Swaps the order of project and limit so the limit is above the project, allowing
+    the limit to reduce rows before projection evaluation.
+
+*** PushDownAliasThroughJoin (PUSH_DOWN_ALIAS_THROUGH_JOIN)
+    Pushes alias definitions (where the alias child is a simple slot) down into both
+    sides of a join, replacing the slot in each child with the alias so downstream
+    planning sees the alias name earlier.
+
+*** PushDownAliasIntoUnionAll
+    Pushes alias definitions into each child of a UNION ALL, normalizing column
+    references across union branches.
+
+*** PushProjectThroughUnion (PUSH_PROJECT_THROUGH_UNION)
+    Pushes a project node down through the union operator into each child by rewriting
+    project expressions against each child's output slots, so each child applies
+    its own projection independently.
+
+*** PushProjectIntoUnion (PUSH_PROJECT_INTO_UNION)
+    Merges a project above a UNION ALL directly into the union (removing the project node),
+    rewriting the union's output and constant expressions to incorporate the projection.
+
+*** PushDownNestedColumnThroughAggregate
+    Pushes nested column access expressions through aggregate nodes to prune
+    sub-fields of complex types before aggregation.
+
+** Limit / TopN Pushdown
+
+*** SplitLimit (SPLIT_LIMIT)
+    Splits a single LogicalLimit into a two-phase limit (global + local): the local limit
+    fetches limit+offset rows with zero offset, and the global limit applies the final
+    offset and limit. Enables parallel limit execution.
+
+*** LimitSortToTopN (LIMIT_SORT_TO_TOP_N)
+    Combines a Limit on top of a Sort (or a project between them) into a single
+    LogicalTopN node, enabling TopN optimization (heap-based, not full sort).
+
+*** LimitAggToTopNAgg (LIMIT_AGG_TO_TOPN_AGG)
+    Converts Limit → Aggregate (with GROUP BY) into TopN → Aggregate by generating
+    order-by keys from the group-by expressions, enabling topN-filter optimization
+    for grouped aggregates.
+
+*** PushDownTopNThroughJoin (PUSH_DOWN_TOP_N_THROUGH_JOIN)
+    Pushes a TopN (limit + sort) into the left side of an outer or cross join by
+    injecting a limit into the left child, reducing rows before the join.
+
+*** PushDownTopNThroughProjectJoin
+    Variant handling the case where a project sits between the TopN and the join.
+
+*** PushDownTopNDistinctThroughJoin (PUSH_DOWN_TOP_N_DISTINCT_THROUGH_JOIN)
+    Pushes a TopN on top of a distinct aggregate through an outer/cross join into
+    the left child, reducing rows before deduplication and the join.
+
+*** PushDownTopNThroughWindow (PUSH_DOWN_TOP_N_THROUGH_WINDOW)
+    Converts a TopN above a window into a PartitionTopN by pushing the per-partition
+    limit through the window, enabling early row pruning per partition.
+
+*** PushDownTopNThroughUnion (PUSH_DOWN_TOP_N_THROUGH_UNION)
+    Pushes a TopN node down through a UNION ALL into each child branch, applying
+    the same order-by and limit independently on each child.
+
+*** PushDownTopNDistinctThroughUnion
+    Pushes a TopN on top of a distinct aggregate through a UNION ALL into each child.
+
+*** PushDownLimitThroughJoin / PushDownLimitThroughProjectJoin
+    Pushes a LIMIT (without sort) through a join into the left child.
+
+*** PushDownLimitThroughWindow / PushDownLimitThroughProjectWindow
+    Pushes a LIMIT through a window operator.
+
+*** PushDownLimitThroughUnion
+    Pushes a LIMIT through a UNION ALL into each child branch.
+
+*** PushDownLimitDistinctThroughJoin (PUSH_DOWN_LIMIT_DISTINCT_THROUGH_JOIN)
+    Pushes a Limit on top of a distinct aggregate through a join into the left child,
+    reducing rows before deduplication and the join.
+
+*** PushDownLimitDistinctThroughProjectJoin
+    Variant handling the case where a project sits between the limit-distinct and the join.
+
+*** PushDownLimitDistinctThroughUnion
+    Pushes a Limit on top of a distinct aggregate through a UNION ALL into each child.
+
+*** PushDownDistinctThroughJoin (PUSH_DOWN_DISTINCT_THROUGH_JOIN)
+    Pushes a DISTINCT operation through a join when the distinct columns come from
+    only one side, reducing rows before the join.
+
+** Aggregate Pushdown & Rewrite
+
+*** PushDownAggThroughJoin (PUSH_DOWN_AGG_THROUGH_JOIN)
+    Pushes a count(x)/count(*) aggregation below an inner join by rewriting it as
+    sum(cnt * cntStar) over aggregated sub-results. Implements eager/lazy aggregation
+    to reduce join input cardinality.
+
+*** PushDownAggWithDistinctThroughJoinOneSide
+    Pushes a distinct aggregate (min/max/sum/count) through a join on only one side
+    (the side containing the aggregation column) to reduce rows before the join.
+
+*** PushDownAggThroughJoinOnPkFk (PUSH_DOWN_AGG_THROUGH_JOIN_ON_PKFK)
+    Pushes a grouped aggregate below a join when the join is on a primary-key/foreign-key
+    relationship, deducing that aggregation can be pushed to the FK side without changing
+    results. Leverages referential integrity constraints.
+
+*** PushDownAggThroughJoinOneSide
+    Pushes aggregate through a join when all aggregate arguments come from one side
+    and the join is on unique keys for that side.
+
+*** PushCountIntoUnionAll (PUSH_COUNT_INTO_UNION_ALL)
+    Pushes a count(x)/count(*) aggregation below a UNION ALL by replacing the top-level
+    aggregate with sum0(...) over per-child partial aggregate results: count becomes
+    sum of counts.
+
+*** CountDistinctRewrite (COUNT_DISTINCT_REWRITE)
+    Rewrites count(distinct bitmap_col) to bitmap_union_count(bitmap_col) and
+    count(distinct hll_col) to hll_union_agg(hll_col) for bitmap/HLL type columns,
+    leveraging native approximate-count data structures.
+
+*** DistinctAggregateRewriter (DISTINCT_AGGREGATE_SPLIT)
+    Splits distinct aggregates (with GROUP BY) into a two-layer plan: a lower deduplication
+    aggregate (group by all distinct columns + group-by keys) and an upper simple aggregate.
+    Or converts to multi-distinct aggregate function depending on the strategy.
+
+*** DistinctAggStrategySelector (DISTINCT_AGG_STRATEGY_SELECTOR)
+    Chooses the optimal strategy for multiple distinct aggregates — either CTE-based
+    decomposition (one distinct per CTE) or a single multi-distinct function — based on
+    cardinality estimates and memory constraints.
+
+*** MultiDistinctFunctionStrategy (PROCESS_SCALAR_AGG_MUST_USE_MULTI_DISTINCT)
+    Rewrites distinct aggregate functions to their multi_distinct_* variants for
+    optimized execution when multiple distinct aggregates exist on the same column.
+
+*** SplitMultiDistinctStrategy
+    Splits aggregate nodes with multiple distinct columns into multiple aggregate nodes
+    connected by joins for efficient multi-distinct execution when CTE-based
+    decomposition is chosen.
+
+*** DecomposeRepeatWithPreAggregation (DECOMPOSE_REPEAT)
+    Decomposes large grouping sets (e.g., ROLLUP with many dimensions) into a
+    pre-aggregated CTE plus subsequent per-grouping-set aggregations, reducing
+    redundant computation across grouping sets.
+
+*** BuildAggForUnion (BUILD_AGG_FOR_UNION)
+    Converts UNION [DISTINCT] (a LogicalUnion with DISTINCT qualifier) into
+    Aggregate(...) → UNION ALL, placing deduplication in an explicit aggregate
+    for more optimization opportunities.
+
+*** ReduceAggregateChildOutputRows (REDUCE_AGGREGATE_CHILD_OUTPUT_ROWS)
+    For aggregates with only min(constant) or max(constant) functions, reduces the child
+    to a single row via LIMIT 1 (scalar) or replaces with GROUP BY columns only (grouped),
+    since min/max of a constant equals the constant itself.
+
+*** SetPreAggStatus (SET_PREAGG_STATUS)
+    Bottom-up traversal of the plan tree to decide whether each LogicalOlapScan can use
+    pre-aggregation (materialized view aggregation), based on the aggregate functions
+    and keys required above it. Sets a flag on the scan for the storage layer.
+
+*** NormalizeToSlot (NORMALIZE_TO_SLOT)
+    Provides context to normalize expressions to slot references, replacing complex
+    expressions with existing aliases to simplify downstream processing.
+
+*** SimplifyAggGroupBy (SIMPLIFY_AGG_GROUP_BY)
+    Simplifies group-by expressions by removing trivial arithmetic expressions
+    (e.g., GROUP BY a+0 → GROUP BY a, GROUP BY a*1 → GROUP BY a).
+
+** Join Rewrites
+
+*** ReorderJoin (REORDER_JOIN)
+    Flattens a cluster of joins with a top filter into a multi-join, then reorders
+    the joins and redistributes the filter conditions to eliminate cross joins.
+    This is the initial join reorder pass before CBO exploration.
+
+*** InitJoinOrder (INIT_JOIN_ORDER)
+    Swaps join children based on estimated row counts (if stats are available) before
+    the full join reordering pass, providing a reasonable initial join order for large
+    queries. Smaller estimated tables go to the right/build side.
+
+*** TransposeSemiJoinLogicalJoin (TRANSPOSE_LOGICAL_SEMI_JOIN_LOGICAL_JOIN)
+    Transposes a semi/anti join with an inner/outer join below it, moving the semi/anti
+    join into one side of the inner join. Enables earlier row filtering by semi-joins.
+
+*** TransposeSemiJoinLogicalJoinProject
+    Same as above but handles the case where a project exists between the semi join
+    and the inner join.
+
+*** SemiJoinCommute (LOGICAL_SEMI_JOIN_COMMUTE)
+    Converts right semi/anti/outer joins to their left-side equivalents by swapping
+    the children, enabling more join order optimization options.
+
+*** TransposeSemiJoinAgg (TRANSPOSE_LOGICAL_SEMI_JOIN_AGG)
+    Pushes a left semi/anti join below an aggregate on the left side, so deduplication
+    (semi-join) happens before aggregation, reducing rows early.
+
+*** TransposeSemiJoinAggProject
+    Same as above but handles the case where a project sits between the semi join
+    and the aggregate.
+
+*** PushDownJoinOnAssertNumRows (PUSH_DOWN_JOIN_ON_ASSERT_NUM_ROWS)
+    Pushes join conditions below an AssertNumRows node when possible, to filter
+    earlier and reduce the rows that AssertNumRows needs to check.
+
+*** ConvertInnerOrCrossJoin (INNER_TO_CROSS_JOIN / CROSS_TO_INNER_JOIN)
+    Converts inner joins without conditions to cross joins (simpler execution), and
+    cross joins with filter conditions to inner joins (better optimization opportunities).
+
+*** ProjectOtherJoinConditionForNestedLoopJoin
+    Wraps non-equi join conditions in a projection referencing both sides so they can
+    be evaluated in a nested loop join, which requires post-join expression evaluation.
+
+*** AddProjectForJoin (ADD_PROJECT_FOR_JOIN)
+    Ensures that join children have projects on top to prevent column ambiguity and
+    ensure correct slot resolution when joins share column names.
+
+*** AddProjectForVolatileExpression (ADD_PROJECT_FOR_VOLATILE_EXPRESSION)
+    Wraps volatile expressions (e.g., random(), now()) in a projection below the join
+    so they are computed once and not re-evaluated for each join iteration, preventing
+    correctness issues.
+
+*** FindHashConditionForJoin (FIND_HASH_CONDITION_FOR_JOIN)
+    Identifies equality conjuncts from join conditions that can be used for hash-based
+    join execution. Separates hash conditions from other join conditions.
+
+*** JoinExtractOrFromCaseWhen (JOIN_EXTRACT_OR_FROM_CASE_WHEN)
+    Extracts CASE WHEN conditions from join equality conditions into OR-based join
+    conditions to enable more join optimization patterns.
+
+*** ExtractFilterFromCrossJoin (EXTRACT_FILTER_FROM_JOIN)
+    Extracts filtering predicates from a cross join's other-join-conjuncts and converts
+    them into a separate filter node above the join, normalizing the plan.
+
+** Eliminate Rules — Logical Plan Simplification
+   These rules remove unnecessary operators, simplifying the plan for better performance
+   and enabling further optimizations.
+
+*** EliminateAggregate (ELIMINATE_AGGREGATE)
+    Removes redundant nested aggregate nodes when the outer and inner aggregates have
+    the same grouping expressions — the inner aggregate is unnecessary.
+
+*** EliminateAggCaseWhen (ELIMINATE_AGG_CASE_WHEN)
+    Rewrites aggregate functions containing case when or if into aggregate functions with
+    a filter clause, pushing the condition into a filter for better evaluation.
+
+*** EliminateLimit (ELIMINATE_LIMIT)
+    Replaces a LIMIT 0 node with an empty relation. Also handles LIMIT on one-row
+    relations and empty relations.
+
+*** EliminateFilter (ELIMINATE_FILTER)
+    Removes filters that are always true (tautologies), always false (replaces with empty
+    relation), or filters with no conjuncts left after constant folding. Also removes
+    filters on one-row-relations where the predicate is constant-foldable.
+
+*** EliminateConstHashJoinCondition (ELIMINATE_CONST_JOIN_CONDITION)
+    Removes hash join equality conditions when both sides are already constrained to
+    the same constant. Example: T1.a=T2.a AND T1.a=1 AND T2.a=1 eliminates T1.a=T2.a
+    since the equality is implied by the constant constraints.
+
+*** EliminateJoinCondition (ELIMINATE_JOIN_CONDITION)
+    Removes join conditions that are trivially true from both hash and other join
+    conjuncts, simplifying the join.
+
+*** EliminateSemiJoin (ELIMINATE_SEMI_JOIN)
+    Eliminates semi/anti joins whose conditions are trivially false (replaces with empty
+    relation) or trivially true (replaces with the child plan directly).
+
+*** EliminateOuterJoin (ELIMINATE_OUTER_JOIN)
+    Converts outer joins to inner joins (or removes them entirely) when filter conditions
+    make the outer join semantics unnecessary — e.g., when a subsequent filter rejects
+    NULLs on the inner side.
+
+*** ConvertOuterJoinToAntiJoin (CONVERT_OUTER_JOIN_TO_ANTI)
+    Converts outer joins (LEFT/RIGHT/FULL) to anti joins when the join condition contains
+    IS NULL checks on the inner side, making the anti-join semantics explicit.
+
+*** EliminateGroupBy (ELIMINATE_GROUP_BY)
+    Removes the LogicalAggregate node when there are no aggregate functions and no
+    group-by expressions — a plain DISTINCT or vacuous GROUP BY.
+
+*** EliminateGroupByKey (ELIMINATE_GROUP_BY_KEY)
+    Removes redundant group-by keys that are functionally dependent on other group-by keys.
+    Example: GROUP BY a, b where a → b (functional dependency), eliminates b.
+
+*** EliminateGroupByKeyByUniform (ELIMINATE_GROUP_BY_KEY_BY_UNIFORM)
+    Further simplifies group-by keys by removing keys that are uniformly distributed
+    (same value across all rows) via functional dependency analysis. A uniform column
+    contributes nothing to the grouping.
+
+*** EliminateOrderByKey (ELIMINATE_ORDER_BY_KEY)
+    Removes ordering keys from a sort node that are functionally dependent on preceding
+    order keys. Example: ORDER BY a, b where a → b, eliminates b.
+
+*** EliminateOrderByConstant (ELIMINATE_ORDER_BY_CONSTANT)
+    Removes ordering keys that are constant expressions from a sort node, since
+    sorting by a constant has no effect on the row order.
+
+*** EliminateSort (ELIMINATE_SORT)
+    Eliminates sort operators that are not directly below a result sink, since
+    intermediate ordering is unnecessary for correctness.
+
+*** EliminateSortUnderSubqueryOrView
+    Removes sort nodes inside subqueries or views, since ordering is only meaningful
+    at the outermost query level.
+
+*** EliminateNotNull (ELIMINATE_NOT_NULL)
+    Infers and adds IS NOT NULL predicates to filter/join conditions for slots involved
+    in expressions that would produce NULL with null inputs. Example: a+b > 0 implies
+    a IS NOT NULL AND b IS NOT NULL.
+
+*** EliminateUnnecessaryProject (ELIMINATE_UNNECESSARY_PROJECT)
+    Removes project nodes whose output is identical to their child's output, eliminating
+    redundant projects left behind after column pruning.
+
+*** EliminateDedupJoinCondition (ELIMINATE_DEDUP_JOIN_CONDITION)
+    Removes duplicate conjuncts from join conditions (hash, other, and mark join conjuncts),
+    cleaning up after other rewrites that may introduce redundant conditions.
+
+*** EliminateNullAwareLeftAntiJoin (ELIMINATE_NULL_AWARE_LEFT_ANTI_JOIN)
+    Converts null-aware left anti joins to regular left anti joins when no conjuncts
+    are nullable, making execution more efficient by removing null-awareness overhead.
+
+*** EliminateAssertNumRows (ELIMINATE_ASSERT_NUM_ROWS)
+    Removes AssertNumRows nodes that are guaranteed to pass (e.g., EQ 0 on an empty
+    relation, EQ 1 on a one-row relation), eliminating unnecessary runtime checks.
+
+*** EliminateJoinByUnique / EliminateJoinByUK (ELIMINATE_JOIN_BY_UK)
+    Eliminates a left outer join when all projected columns come from the left side
+    and the right side has unique keys — the join cannot add or remove rows.
+
+*** EliminateJoinByFK (ELIMINATE_JOIN_BY_FK)
+    Eliminates joins when a foreign-key relationship guarantees the join will not add
+    or remove rows, replacing the join with just the left side. Leverages referential
+    integrity constraints.
+
+*** EliminateFilterGroupByKey
+    Removes filter predicates on group-by keys that are already constrained by the
+    groups, simplifying the filter.
+
+** Empty Relation Propagation
+
+*** EliminateEmptyRelation (ELIMINATE_*_ON_EMPTYRELATION)
+    Propagates empty relations upward through the plan tree using empty-relation algebra:
+    - ELIMINATE_JOIN_ON_EMPTYRELATION: Join with empty child → empty
+    - ELIMINATE_FILTER_ON_EMPTYRELATION: Filter on empty → empty
+    - ELIMINATE_AGG_ON_EMPTYRELATION: Aggregate on empty → empty
+    - ELIMINATE_PROJECT_ON_EMPTYRELATION: Project on empty → empty
+    - ELIMINATE_UNION_ON_EMPTYRELATION: Union with only empty children → empty
+    - ELIMINATE_INTERSECTION_ON_EMPTYRELATION: Intersect with empty → empty
+    - ELIMINATE_EXCEPT_ON_EMPTYRELATION: Except with empty left → empty
+    - ELIMINATE_TOPN_ON_EMPTYRELATION: TopN on empty → empty
+    - ELIMINATE_SORT_ON_EMPTYRELATION: Sort on empty → empty
+
+** Merge Consecutive Operators
+   These rules combine adjacent same-type operators for efficiency.
+
+*** MergeProjects (MERGE_PROJECTS) / MergeProjectable
+    Merges consecutive project nodes into a single project. MergeProjectable handles
+    the special case where the child implements ProjectMergeable (like OneRowRelation).
+
+*** MergeFilters (MERGE_FILTERS)
+    Merges consecutive filter nodes into a single filter with conjoined predicates,
+    reducing the number of plan nodes and enabling better combined predicate optimization.
+
+*** MergeLimits (MERGE_LIMITS)
+    Merges consecutive limit nodes, taking the minimum limit and the inner offset
+    from the two nodes.
+
+*** MergeGenerates (MERGE_GENERATES)
+    Merges consecutive generator (lateral view / explode) nodes when the top generator
+    does not depend on the bottom generator's output.
+
+*** MergeAggregate (MERGE_AGGREGATE)
+    Merges two consecutive aggregate nodes (e.g., from count-distinct rewrite) into a
+    single aggregate when the inner aggregate's group-by keys are a superset of the outer's.
+
+*** MergeSetOperations (MERGE_SET_OPERATION)
+    Flattens nested Union/Intersect nodes of the same type and qualifier into a single
+    n-ary set operation, reducing plan depth and enabling union-all optimizations.
+
+*** MergeSetOperationsExcept (MERGE_SET_OPERATION_EXCEPT)
+    Flattens left-deep nested Except trees into a single n-ary Except node.
+
+*** MergeTopNs (MERGE_TOP_N)
+    Merges consecutive TopN nodes, keeping the longer ordering from the inner and
+    computing the combined limit/offset.
+
+*** MergePercentileToArray (MERGE_PERCENTILE_TO_ARRAY)
+    Merges multiple percentile calls on the same column into a single percentile_array
+    call to reduce redundant computation.
+
+** Union Rewrites
+
+*** PushProjectThroughUnion / PushProjectIntoUnion
+    Pushes projects through/into union nodes. PushProjectThroughUnion pushes the project
+    into each child; PushProjectIntoUnion merges the project directly into the union.
+
+*** MergeOneRowRelationIntoUnion (MERGE_ONE_ROW_RELATION_INTO_UNION)
+    Merges simple one-row constant relations (e.g., SELECT 1) into union branches for
+    simpler physical property computation.
+
+*** HideOneRowRelationUnderUnion
+    Hides one-row relations under union nodes to avoid them being separately optimized.
+
+*** PullUpJoinFromUnionAll (PULL_UP_JOIN_FROM_UNION_ALL)
+    Pulls join predicates above a UNION ALL when the join conditions can be decomposed
+    per union child, converting into UNION ALL of joins. Enables more localized joins.
+
+** Scan Optimization
+   These rules optimize table scans by pruning partitions/tablets and pushing
+   filters/computations into the storage layer.
+
+*** PruneOlapScanPartition (OLAP_SCAN_PARTITION_PRUNE)
+    Prunes OLAP table partitions at scan time based on filter predicates, selecting only
+    the partitions relevant to the query. Uses partition key ranges from WHERE clauses.
+
+*** PruneOlapScanTablet (OLAP_SCAN_TABLET_PRUNE)
+    Prunes OLAP table tablets (buckets) at scan time based on hash-distribution key
+    equality predicates. Only the tablets containing matching hash values are scanned.
+
+*** PruneFileScanPartition (FILE_SCAN_PARTITION_PRUNE)
+    Prunes file-based (external) table partitions at scan time based on filter predicates
+    on partition columns. Reduces files scanned from external storage.
+
+*** PushDownFilterIntoSchemaScan (PUSH_FILTER_INTO_SCHEMA_SCAN)
+    Extracts equality predicates on catalog/database/table name columns from the filter
+    and pushes them into the LogicalSchemaScan node as frontend conjuncts for early
+    metadata filtering.
+
+*** PushConjunctsIntoJdbcScan / PushConjunctsIntoOdbcScan / PushConjunctsIntoEsScan
+    Pushes filter predicates into JDBC, ODBC, and Elasticsearch scans so they are
+    evaluated at the external data source, reducing data transfer.
+
+*** PushDownVirtualColumnsIntoOlapScan
+    Pushes expressions that reference only materialized columns into the scan as virtual
+    columns, enabling them to be computed directly at the storage layer rather than
+    in a separate project node.
+
+*** PushDownMatchProjectionAsVirtualColumn
+    Pushes MATCH expressions in projections down to the scan layer as virtual columns
+    for inverted index evaluation at the storage level.
+
+*** PushDownScoreTopNIntoOlapScan
+    Pushes TopN with score-based ordering (e.g., from fulltext search relevance scoring)
+    into the OLAP scan to leverage inverted index early termination.
+
+*** PushDownVectorTopNIntoOlapScan
+    Pushes TopN with vector similarity functions (e.g., cosine distance) into the OLAP
+    scan to leverage vector index early termination.
+
+*** PushAggregateToOlapScan
+    Pushes simple aggregate operations (COUNT, MIN, MAX, SUM) into the OLAP scan so they
+    are computed at the storage layer using pre-aggregated data.
+
+** Materialized Index Selection (RBO)
+   These rules match query patterns against available materialized (rollup) indexes
+   on OLAP tables and rewrite the scan to use the best matching index.
+
+*** MATERIALIZED_INDEX_SCAN
+    Matches a plain scan to a materialized index that covers the required columns.
+
+*** MATERIALIZED_INDEX_FILTER_SCAN / MATERIALIZED_INDEX_PROJECT_SCAN
+    Matches filter+scan and project+scan patterns to appropriate indexes.
+
+*** MATERIALIZED_INDEX_PROJECT_FILTER_SCAN / MATERIALIZED_INDEX_FILTER_PROJECT_SCAN
+    Matches project-filter-scan chains to indexes.
+
+*** MATERIALIZED_INDEX_AGG_SCAN (and variants)
+    Matches aggregate+scan patterns to aggregate rollup indexes, enabling pre-aggregated
+    data to serve aggregate queries. Variants handle filter and project in between.
+
+*** MATERIALIZED_INDEX_AGG_REPEAT_SCAN (and variants)
+    Matches repeat (grouping sets) + scan patterns to appropriate rollup indexes.
+
+** Predicate Inference
+   These rules infer new predicates from existing ones, enriching the filter/join
+   conditions for better pushdown and pruning.
+
+*** InferPredicates (INFER_PREDICATES)
+    Infers additional predicates from EqualTo conditions in join conjuncts and filters,
+    propagating them to both sides for more efficient filter pushdown. Example: from
+    a.id = b.id, propagates predicates on a.id to b.id.
+
+*** InferPredicateByReplace
+    Infers predicates by replacing slots with equal expressions from equality conditions.
+    Companion to InferPredicates that handles more complex expression patterns.
+
+*** ConstantPropagation (CONSTANT_PROPAGATION)
+    Propagates constants through equality predicates. Example: a=1 AND a=b → adds b=1,
+    enabling further constant folding and partition pruning.
+
+*** InferAggNotNull (INFER_AGG_NOT_NULL)
+    Infers IS NOT NULL constraints on aggregate function arguments. Example: count(a)
+    implies a IS NOT NULL can be pushed to the child for earlier filtering.
+
+*** InferFilterNotNull (INFER_FILTER_NOT_NULL)
+    Infers IS NOT NULL constraints from filter expressions. Example: a+b > 0 implies
+    a IS NOT NULL AND b IS NOT NULL.
+
+*** InferJoinNotNull (INFER_JOIN_NOT_NULL)
+    Infers IS NOT NULL constraints from join equality conditions. Example: a.id = b.id
+    in an inner join implies both id columns are not null.
+
+*** InferSetOperatorDistinct (INFER_SET_OPERATOR_DISTINCT)
+    Infers distinct aggregates for each child of Intersect/Except set operations to
+    eliminate duplicates earlier, reducing set operation input sizes.
+
+*** InferInPredicateFromOr (EXTRACT_IN_PREDICATE_FROM_OR)
+    Converts chains of OR comparisons on the same column into IN predicates.
+    Example: a=1 OR a=2 OR a=3 → a IN (1,2,3), enabling better index utilization.
+
+*** UnequalPredicateInfer (UNEQUAL_PREDICATE_INFER)
+    Infers range predicates (>, <, >=, <=) from join equality relationships.
+    Example: if a.x = b.y and filter has b.y > 10, infer a.x > 10.
+
+** CTE (Common Table Expression) Rewrites
+
+*** PullUpCteAnchor (PULL_UP_CTE_ANCHOR)
+    Pulls CTE anchors to the top of the plan tree so they do not interfere with
+    other rewrite rules that operate on joins and filters.
+
+*** CTEInline (CTE_INLINE)
+    Inlines CTE producers into their consumers when there is a single consumer,
+    removing the CTE indirection for trivial cases.
+
+*** RewriteCteChildren (REWRITE_CTE_CHILDREN)
+    Re-applies rewrite rules within the CTE producer context, reusing optimized
+    plans from the consumer side to avoid redundant optimization work.
+
+*** CollectFilterAboveConsumer (COLLECT_FILTER_ABOVE_CTE_CONSUMER)
+    Collects filter predicates from above CTE consumers and registers them for
+    pushdown into the CTE producer, enabling cross-consumer filter optimization.
+
+*** CollectLimitAboveConsumer (COLLECT_LIMIT_ABOVE_CTE_CONSUMER)
+    Collects limit information from above CTE consumers and registers it for use
+    by the CTE producer to limit the rows computed.
+
+*** CollectCteConsumerOutput (COLLECT_CTE_CONSUMER_OUTPUT)
+    Collects the output slots used by CTE consumers and registers them so the
+    CTE producer can prune unnecessary columns.
+
+** Column / Partition Collection (Metadata)
+
+*** CollectPredicateOnScan (COLLECT_FILTER)
+    Collects filter predicates pushed down onto scan nodes for use in the HBO
+    (History-Based Optimization) framework.
+
+*** QueryPartitionCollector (COLLECT_PARTITIONS)
+    Collects partition information from scans for use in materialized view
+    partition compensation.
+
+*** OperativeColumnDerive (OPERATIVE_COLUMN_DERIVE)
+    Derives which columns are "operative" (distinct values needed) from the query
+    to identify potential narrow tables for optimization.
+
+*** CollectScanFilter / CollectScanProjectFilter
+    Collects filter/project information on scans for metadata-driven optimizations.
+
+** Short Circuit / Point Query
+
+*** LogicalResultSinkToShortCircuitPointQuery (SHOR_CIRCUIT_POINT_QUERY)
+    Converts point queries (exact key lookups for unique/duplicate key tables) into
+    a short-circuit path that reads directly via key lookup, bypassing the full
+    scan-execution pipeline for low-latency point reads.
+
+** Skew / Salt Handling
+
+*** SaltJoin (SALT_JOIN)
+    Applies salt-based join optimization to mitigate data skew by adding salt keys
+    (random values) to both sides of a join, spreading skewed key groups across
+    multiple parallel tasks.
+
+*** SkewJoin
+    Detects data skew in join keys and applies skew join handling — splitting skewed
+    values for separate processing and broadcasting the complement.
+
+** Other Rewrites
+
+*** AdjustNullable (ADJUST_NULLABLE)
+    Adjusts the nullable property of expressions and slots throughout the plan after
+    structure-changing rewrites (e.g., outer join elimination may make previously
+    nullable columns non-nullable).
+
+*** AdjustConjunctsReturnType (ADJUST_CONJUNCTS_RETURN_TYPE)
+    Casts all filter and join conjuncts to boolean type after rewrites, ensuring
+    type correctness for predicate evaluation.
+
+*** ClearContextStatus (CLEAR_CONTEXT_STATUS)
+    Clears CTE environment state from the statement context after rewrite is complete,
+    preventing stale state from affecting subsequent queries.
+
+*** CheckPrivileges (CHECK_PRIVILEGES)
+    Validates user privileges for all tables and views referenced in the plan.
+    Runs after all rewrites to ensure the final plan only accesses authorized objects.
+
+*** StatsDerive (STATS_DERIVER)
+    Derives and sets cardinality/statistics estimates on all plan nodes by running
+    the statistics calculator. Essential for cost-based decisions.
+
+*** PruneEmptyPartition (PRUNE_EMPTY_PARTITION)
+    Replaces scans of empty partitions (e.g., in load transactions with no data)
+    with empty relations, preventing unnecessary scan execution.
+
+*** PushDownUnnestInProject (PUSH_DOWN_UNNEST_IN_PROJECT)
+    Pushes unnest table-generating functions from projections down into the
+    appropriate scan or child node for earlier evaluation.
+
+*** SkipSimpleExprs (SKIP_SIMPLE_EXPRS)
+    Utility for detecting and skipping simple expressions — used to avoid
+    over-inferring predicates on trivial expressions.
+
+*** RecordPlanForMvPreRewrite (RECORD_PLAN_FOR_MV_PRE_REWRITE)
+    Records the current plan structure for later materialized view rewrite attempts,
+    enabling MV matching to see the pre-optimization plan shape.
+
+*** PullUpProjectExprUnderTopN (PULL_UP_PROJECT_EXPR_UNDER_TOPN)
+    Pulls up expressions from projects that are under a TopN to enable more
+    efficient sorting and reduce computation.
+
+*** PullUpProjectBetweenTopNAndAgg (PULL_UP_PROJECT_BETWEEN_TOPN_AND_AGG)
+    Pulls up simple column projections from between a TopN and an Aggregate to
+    enable TopN pushdown past aggregates.
+
+*** SimplifyEncodeDecode (SIMPLIFY_ENCODE_DECODE)
+    Removes redundant encode-decode pairs (encode(decode(A)) → A) in project
+    expressions, cleaning up after compressed materialization.
+
+*** PushDownEncodeSlot / DecoupleEncodeDecode
+    Push encode/decode functions for dictionary encoding through the plan.
+    DecoupleEncodeDecode removes redundant decode-encode pairs.
+
+*** ExtractSingleTableExpressionFromDisjunction
+    Extracts single-table conjuncts from disjunctive (OR) conditions so they can
+    be pushed down to individual scan nodes even when embedded in OR expressions.
+
+*** OrExpansion (OR_EXPANSION)
+    Expands OR predicates in filter/join conditions into UNION ALL branches,
+    enabling better partition pruning and index utilization per branch.
+
+* Exploration Rules (CBO)
+  Exploration rules generate alternative plans in the Cascades memo. The cost model
+  chooses the best alternative. They run inside the DPHyp / Cascades join enumeration
+  framework.
+
+** Join Reorder
+   These rules transform join trees to explore different join orders.
+
+*** JoinCommute (LOGICAL_JOIN_COMMUTE)
+    Swaps the left and right children of a join to explore different join orderings.
+    Has different modes: LEFT_ZIG_ZAG (no column stats), ZIG_ZAG (zig-zag enumeration),
+    BUSHY (bushy tree enumeration), and non-inner join swaps (outer/semi/anti commutes).
+
+*** InnerJoinLAsscomProject (LOGICAL_INNER_JOIN_LASSCOM)
+    Reassociates inner joins from (A ⨝ (B ⨝ C)) to ((A ⨝ B) ⨝ C) for left-associative
+    join tree transformation. Handles intervening projects.
+
+*** InnerJoinLeftAssociateProject (LOGICAL_INNER_JOIN_LEFT_ASSOCIATIVE)
+    Left-associative join transformation: (A ⨝ (B ⨝ C)) → ((A ⨝ B) ⨝ C). Used in
+    bushy-tree enumeration to generate new join orders.
+
+*** InnerJoinRightAssociateProject (LOGICAL_INNER_JOIN_RIGHT_ASSOCIATIVE)
+    Right-associative join transformation: ((A ⨝ B) ⨝ C) → (A ⨝ (B ⨝ C)). The
+    inverse of left-association.
+
+*** OuterJoinLAsscomProject (LOGICAL_OUTER_JOIN_LASSCOM)
+    Left-associative and commutative transformations for outer joins involving
+    INNER and LEFT OUTER join type pairs. Preserves outer join semantics.
+
+*** OuterJoinAssocProject (LOGICAL_OUTER_JOIN_ASSOC)
+    Reassociates outer joins (left outer, full outer) with projects to explore
+    alternative join tree shapes while preserving outer join semantics.
+
+*** JoinExchangeBothProject (LOGICAL_JOIN_EXCHANGE)
+    Exchanges both children of a join by pushing projects down on both sides,
+    enabling further join reordering optimization. Variants: LEFT_PROJECT,
+    RIGHT_PROJECT, BOTH_PROJECT.
+
+** Semi-Join Reorder
+
+*** LogicalJoinSemiJoinTransposeProject
+    Transposes a SemiJoin under a regular join: Join(SemiJoin(A,B), C) →
+    SemiJoin(Join(A,C), B). Also supports LEFT_PROJECT and RIGHT_PROJECT variants.
+
+*** SemiJoinSemiJoinTransposeProject
+    Transposes two consecutive semi/anti joins: SemiJoin1(SemiJoin2(A,B), C) →
+    SemiJoin2(SemiJoin1(A,C), B). Explores different semi-join orders.
+
+*** TransposeAggSemiJoin (TRANSPOSE_LOGICAL_AGG_SEMI_JOIN)
+    Pulls up a SemiJoin through an Aggregate: Agg(SemiJoin(A,B)) →
+    SemiJoin(Agg(A), B). Allows earlier filtering by the semi-join.
+
+*** TransposeAggSemiJoinProject
+    Same as above but handles the case where a project sits between the aggregate
+    and the semi-join.
+
+*** PushDownProjectThroughSemiJoin
+    Pushes a project node down through a left-semi/anti join to move projections
+    closer to scans and improve join ordering options.
+
+*** PushDownProjectThroughInnerOuterJoin
+    Pushes a project node down through inner/outer joins, splitting it into two
+    projects on each child for better column pruning before the join.
+
+** Set Operation Reorder
+
+*** IntersectReorder (REORDER_INTERSECT)
+    Reorders the children of an INTERSECT DISTINCT so the child with the fewest
+    estimated rows is first, minimizing intermediate result sizes during set
+    intersection evaluation.
+
+*** TransposeLogicalJoinUnion
+    Transposes a join with a union-all below it: Join(Union(A,B), C) →
+    Union(Join(A,C), Join(B,C)). Distributes the join over the union.
+
+** Eager Aggregate (CBO Group-By Pushdown)
+   These rules push aggregates below joins to reduce join input sizes.
+
+*** EagerCount (EAGER_COUNT)
+    Pushes a COUNT aggregation below a join on the right side, then multiplies SUM
+    aggregates by the count value at the top. Reduces join input cardinality when
+    counting after a join.
+
+*** EagerGroupBy (EAGER_GROUP_BY)
+    Pushes a GROUP BY + SUM aggregation below a join on the left side to pre-aggregate
+    and reduce join input size. Only applies when join keys are a superset of group-by keys.
+
+*** EagerGroupByCount (EAGER_GROUP_BY_COUNT)
+    Combines EagerCount and EagerGroupBy: pushes SUM aggregation to the left side with
+    COUNT on the right side below a join, correcting the result at the top.
+
+*** EagerSplit (EAGER_SPLIT)
+    Pushes SUM aggregations to BOTH sides of a join simultaneously, adding COUNT on
+    each side and correcting the result via multiplication at the top. Most aggressive
+    eager aggregation strategy.
+
+** Merge Projects (CBO)
+
+*** MergeProjectsCBO
+    Merges two consecutive Project nodes into a single Project when the inner project's
+    columns are a subset of the outer's. CBO variant specifically for the exploration phase.
+
+* Materialized View Rules
+  These rules match query subtrees against materialized view definitions and rewrite
+  the tree to scan the MV instead. Each rule matches a specific pattern at the top
+  of the query subtree.
+
+** MV Join Rewrites
+
+*** MaterializedViewProjectJoinRule (MATERIALIZED_VIEW_PROJECT_JOIN)
+    Rewrites a Project-above-Join query pattern using an MV, replacing the sub-plan
+    with an MV scan when the query projection and join match the MV definition.
+
+*** MaterializedViewFilterJoinRule (MATERIALIZED_VIEW_FILTER_JOIN)
+    Rewrites a Filter-above-Join query pattern using an MV, matching query filters
+    and join structure against an MV definition.
+
+*** MaterializedViewProjectFilterJoinRule (MATERIALIZED_VIEW_PROJECT_FILTER_JOIN)
+    Rewrites a Project-Filter-Join pattern using an MV.
+
+*** MaterializedViewFilterProjectJoinRule (MATERIALIZED_VIEW_FILTER_PROJECT_JOIN)
+    Rewrites a Filter-Project-Join pattern using an MV.
+
+*** MaterializedViewOnlyJoinRule (MATERIALIZED_VIEW_ONLY_JOIN)
+    Rewrites a bare Join (no wrapping filter or project above) using an MV.
+    Implemented by MaterializedViewProjectFilterProjectJoinRule.
+
+** MV Window + Join (no aggregate)
+    Same pattern as above but with a Window node added:
+    - MATERIALIZED_VIEW_PROJECT_WINDOW_JOIN
+    - MATERIALIZED_VIEW_FILTER_WINDOW_JOIN
+    - MATERIALIZED_VIEW_PROJECT_FILTER_WINDOW_JOIN
+    - MATERIALIZED_VIEW_FILTER_PROJECT_WINDOW_JOIN
+    - MATERIALIZED_VIEW_ONLY_WINDOW_JOIN
+
+** MV Window + Scan (no aggregate)
+    Window-over-scan patterns:
+    - MATERIALIZED_VIEW_FILTER_WINDOW_SCAN
+    - MATERIALIZED_VIEW_PROJECT_WINDOW_SCAN
+    - MATERIALIZED_VIEW_FILTER_PROJECT_WINDOW_SCAN
+    - MATERIALIZED_VIEW_PROJECT_FILTER_WINDOW_SCAN
+    - MATERIALIZED_VIEW_ONLY_WINDOW_SCAN
+
+** MV Window + Aggregate
+    Window-over-aggregate patterns:
+    - MATERIALIZED_VIEW_PROJECT_WINDOW_AGGREGATE
+    - MATERIALIZED_VIEW_FILTER_WINDOW_AGGREGATE
+    - MATERIALIZED_VIEW_PROJECT_FILTER_WINDOW_AGGREGATE
+    - MATERIALIZED_VIEW_FILTER_PROJECT_WINDOW_AGGREGATE
+    - MATERIALIZED_VIEW_ONLY_WINDOW_AGGREGATE
+
+** MV Aggregate
+    Aggregate patterns:
+    - MATERIALIZED_VIEW_PROJECT_AGGREGATE
+    - MATERIALIZED_VIEW_FILTER_AGGREGATE
+    - MATERIALIZED_VIEW_PROJECT_FILTER_AGGREGATE
+    - MATERIALIZED_VIEW_FILTER_PROJECT_AGGREGATE
+    - MATERIALIZED_VIEW_ONLY_AGGREGATE
+
+** MV Aggregate on Non-Aggregate MV
+    Aggregate query on an MV that does not have aggregation:
+    - MATERIALIZED_VIEW_PROJECT_AGGREGATE_ON_NONE_AGGREGATE
+    - MATERIALIZED_VIEW_FILTER_AGGREGATE_ON_NONE_AGGREGATE
+    - MATERIALIZED_VIEW_PROJECT_FILTER_AGGREGATE_ON_NONE_AGGREGATE
+    - MATERIALIZED_VIEW_FILTER_PROJECT_AGGREGATE_ON_NONE_AGGREGATE
+    - MATERIALIZED_VIEW_ONLY_AGGREGATE_ON_NONE_AGGREGATE
+
+** MV Limit / TopN
+    When the query has a LIMIT or TOP-N above a join, aggregate, or scan:
+    - MATERIALIZED_VIEW_LIMIT_UNARY_JOIN / MATERIALIZED_VIEW_LIMIT_JOIN
+    - MATERIALIZED_VIEW_LIMIT_UNARY_AGGREGATE / MATERIALIZED_VIEW_LIMIT_AGGREGATE
+    - MATERIALIZED_VIEW_LIMIT_SCAN
+    - MATERIALIZED_VIEW_TOP_N_UNARY_JOIN / MATERIALIZED_VIEW_TOP_N_JOIN
+    - MATERIALIZED_VIEW_PROJECT_TOP_N_UNARY_JOIN / MATERIALIZED_VIEW_PROJECT_TOP_N_JOIN
+    - MATERIALIZED_VIEW_TOP_N_UNARY_AGGREGATE / MATERIALIZED_VIEW_TOP_N_AGGREGATE
+    - MATERIALIZED_VIEW_PROJECT_TOP_N_UNARY_AGGREGATE / MATERIALIZED_VIEW_PROJECT_TOP_N_AGGREGATE
+    - MATERIALIZED_VIEW_TOP_N_SCAN / MATERIALIZED_VIEW_PROJECT_TOP_N_SCAN
+
+** MV Scan Only
+    Simple scan queries:
+    - MATERIALIZED_VIEW_FILTER_SCAN
+    - MATERIALIZED_VIEW_PROJECT_SCAN
+    - MATERIALIZED_VIEW_FILTER_PROJECT_SCAN
+    - MATERIALIZED_VIEW_PROJECT_FILTER_SCAN
+    - MATERIALIZED_VIEW_ONLY_SCAN
+
+** MV Infrastructure
+
+*** AbstractMaterializedViewRule
+    Base class providing shared infrastructure for all MV rewrite rules, including
+    relation/expression mapping, predicate compensation, and partition-aware rewriting.
+
+*** MaterializationContext / SyncMaterializationContext / AsyncMaterializationContext
+    Context objects for MV matching: Sync for immediate matching, Async for
+    background-compiled MVs, with LogicalCompatibilityContext for validation.
+
+*** Mapping: EquivalenceClassMapping, SlotMapping, RelationMapping, ExpressionMapping
+    Map query expressions/relations/slots to MV expressions/relations/slots.
+    Core data structures for checking MV compatibility.
+
+*** HyperGraphComparator
+    Compares the query's join hypergraph against the MV's hypergraph to determine
+    if an MV can satisfy a query. Handles join order independence.
+
+*** PartitionCompensator / PartitionIncrementMaintainer
+    Handle partition-level MV rewrite: PartitionCompensator determines which partitions
+    need to be read from base tables vs. the MV; PartitionIncrementMaintainer tracks
+    incremental partition updates.
+
+*** PreMaterializedViewRewriter
+    Pre-rewrites queries to maximize MV match opportunities before the main MV
+    matching phase runs.
+
+*** Rollup Handlers
+    Handle aggregate rollup in MVs: DirectRollupHandler (direct mapping), MappingRollupHandler
+    (expression mapping), BothCombinatorRollupHandler (combine two aggregates),
+    SingleCombinatorRollupHandler (single aggregate combinator),
+    ContainDistinctFunctionRollupHandler (distinct within rollup).
+
+* Implementation Rules
+  These rules translate logical plan nodes to physical plan nodes during the
+  implementation phase of Cascades.
+
+** Table Scans
+
+*** LogicalOlapScanToPhysicalOlapScan
+    Converts LogicalOlapScan to PhysicalOlapScan, resolving physical properties like
+    distribution specification, tablet pruning, and pre-aggregation status.
+
+*** LogicalSchemaScanToPhysicalSchemaScan
+    Converts LogicalSchemaScan (metadata queries on information_schema) to PhysicalSchemaScan.
+
+*** LogicalFileScanToPhysicalFileScan
+    Converts LogicalFileScan (external file queries) to PhysicalFileScan.
+
+*** LogicalHudiScanToPhysicalHudiScan
+    Converts LogicalHudiScan (Hudi table queries) to PhysicalHudiScan.
+
+*** LogicalOdbcScanToPhysicalOdbcScan / LogicalJdbcScanToPhysicalJdbcScan / LogicalEsScanToPhysicalEsScan
+    Converts external data source scans (ODBC, JDBC, Elasticsearch) to their physical counterparts.
+
+*** LogicalWorkTableReferenceToPhysicalWorkTableReference
+    Converts recursive CTE work table references to physical form.
+
+** Operators
+
+*** LogicalProjectToPhysicalProject
+    Converts LogicalProject to PhysicalProject.
+
+*** LogicalFilterToPhysicalFilter
+    Converts LogicalFilter to PhysicalFilter.
+
+*** AggregateStrategies (LOGICAL_AGG_TO_PHYSICAL_HASH_AGG_RULE)
+    Converts LogicalAggregate to PhysicalHashAggregate. Selects the appropriate
+    physical implementation: pushing count-on-index to the storage layer, pushing
+    MIN/MAX for unique key tables, enabling physical storage-layer aggregation.
+
+*** LogicalJoinToHashJoin
+    Converts LogicalJoin to PhysicalHashJoin when the join has equi-join conditions
+    suitable for hash-based execution.
+
+*** LogicalJoinToNestedLoopJoin
+    Converts LogicalJoin to PhysicalNestedLoopJoin when it requires nested-loop
+    evaluation (e.g., non-equi join conditions, cross joins).
+
+*** LogicalSortToPhysicalQuickSort
+    Converts LogicalSort to PhysicalQuickSort.
+
+*** LogicalTopNToPhysicalTopN
+    Converts LogicalTopN to PhysicalTopN (heap-based top-N).
+
+*** LogicalPartitionTopNToPhysicalPartitionTopN
+    Converts LogicalPartitionTopN to PhysicalPartitionTopN (per-partition heap).
+
+*** LogicalLimitToPhysicalLimit
+    Converts LogicalLimit to PhysicalLimit.
+
+*** LogicalWindowToPhysicalWindow
+    Converts LogicalWindow to PhysicalWindow.
+
+*** LogicalGenerateToPhysicalGenerate
+    Converts LogicalGenerate (lateral view, explode) to PhysicalGenerate.
+
+*** LogicalRepeatToPhysicalRepeat
+    Converts LogicalRepeat (GROUPING SETS, ROLLUP, CUBE) to PhysicalRepeat.
+
+*** LogicalOneRowRelationToPhysicalOneRowRelation
+    Converts the single-row dummy relation to physical form.
+
+*** LogicalTVFRelationToPhysicalTVFRelation
+    Converts table-valued function relations to physical form.
+
+*** LogicalEmptyRelationToPhysicalEmptyRelation
+    Converts empty relations to physical form (produces zero rows).
+
+*** LogicalAssertNumRowsToPhysicalAssertNumRows
+    Converts the row-count assertion node to physical form.
+
+** Set Operations
+
+*** LogicalUnionToPhysicalUnion
+    Converts LogicalUnion to PhysicalUnion.
+
+*** LogicalRecursiveUnionToPhysicalRecursiveUnion
+    Converts a recursive CTE union to physical form.
+
+*** LogicalRecursiveUnionProducerToPhysicalRecursiveUnionProducer
+    Converts the producer side of a recursive CTE union.
+
+*** LogicalRecursiveUnionAnchorToPhysicalRecursiveUnionAnchor
+    Converts the anchor side of a recursive CTE union.
+
+*** LogicalExceptToPhysicalExcept
+    Converts LogicalExcept to PhysicalExcept.
+
+*** LogicalIntersectToPhysicalIntersect
+    Converts LogicalIntersect to PhysicalIntersect.
+
+** CTE
+
+*** LogicalCTEProducerToPhysicalCTEProducer
+    Converts the CTE definition (producer) to physical form, storing the result
+    for consumption by CTE consumers.
+
+*** LogicalCTEConsumerToPhysicalCTEConsumer
+    Converts the CTE reference (consumer) to physical form, reading from the
+    producer's stored result.
+
+*** LogicalCTEAnchorToPhysicalCTEAnchor
+    Converts the CTE anchor (the plan node that ties producer and consumers together)
+    to physical form.
+
+** Sinks (INSERT / EXPORT)
+
+*** LogicalOlapTableSinkToPhysicalOlapTableSink
+    Converts the INSERT sink for OLAP tables to physical form.
+
+*** LogicalHiveTableSinkToPhysicalHiveTableSink
+    Converts the INSERT sink for Hive tables to physical form.
+
+*** LogicalIcebergTableSinkToPhysicalIcebergTableSink
+    Converts the INSERT sink for Iceberg tables to physical form.
+
+*** LogicalIcebergDeleteSinkToPhysicalIcebergDeleteSink
+    Converts the DELETE sink for Iceberg tables to physical form.
+
+*** LogicalIcebergMergeSinkToPhysicalIcebergMergeSink
+    Converts the MERGE sink for Iceberg tables to physical form.
+
+*** LogicalMaxComputeTableSinkToPhysicalMaxComputeTableSink
+    Converts the INSERT sink for MaxCompute (Alibaba Cloud) tables to physical form.
+
+*** LogicalJdbcTableSinkToPhysicalJdbcTableSink
+    Converts the INSERT sink for JDBC tables to physical form.
+
+*** LogicalConnectorTableSinkToPhysicalConnectorTableSink
+    Converts the INSERT sink for connector-based external tables to physical form.
+
+*** LogicalResultSinkToPhysicalResultSink
+    Converts the query result sink (returns rows to client) to physical form.
+
+*** LogicalFileSinkToPhysicalFileSink
+    Converts the file export sink (SELECT INTO OUTFILE) to physical form.
+
+*** LogicalDictionarySinkToPhysicalDictionarySink
+    Converts the dictionary sink to physical form.
+
+*** LogicalBlackholeSinkToPhysicalBlackholeSink
+    Converts the blackhole sink (discard all rows) to physical form.
+
+*** LogicalTVFTableSinkToPhysicalTVFTableSink
+    Converts the table-valued function sink to physical form.
+
+** Storage Layer Aggregate
+   Push aggregation into the scan at the physical level:
+
+*** STORAGE_LAYER_AGGREGATE_WITHOUT_PROJECT / _WITH_PROJECT
+    Pushes aggregation into OLAP scan when the output is consumed directly or
+    through a project. Computes aggregates at the storage layer for efficiency.
+
+*** STORAGE_LAYER_AGGREGATE_WITHOUT_PROJECT_FOR_FILE_SCAN / _WITH_PROJECT_FOR_FILE_SCAN
+    Same for file-based external tables.
+
+*** STORAGE_LAYER_WITH_PROJECT_NO_SLOT_REF
+    Handles the case where a project above the aggregate references no slot from
+    the scan — pushes aggregation to storage anyway.
+
+*** STORAGE_LAYER_AGGREGATE_MINMAX_ON_UNIQUE / _WITHOUT_PROJECT
+    Pushes MIN/MAX aggregation to storage for unique-key tables, leveraging
+    the unique key structure for efficient extremum computation.
+
+*** COUNT_ON_INDEX / COUNT_ON_INDEX_WITHOUT_PROJECT
+    Pushes COUNT(*) to storage using index metadata rather than scanning data,
+    enabling near-instant count queries on indexed tables.
+
+** Aggregate Split & Skew
+
+*** SplitAggWithoutDistinct
+    Splits aggregation without DISTINCT functions into local and global phases
+    (two-phase aggregation). Optionally generates bucketed hash aggregation for
+    single-BE deployments. Enables parallel aggregation.
+
+*** SplitAggMultiPhase
+    Splits aggregation with DISTINCT functions (with GROUP BY keys) into multi-phase
+    plans: 2+1 phases, 1+2 phases, or 2+2 phases, including skew-aware rewriting
+    with salted bucketing. Handles complex distinct aggregation.
+
+*** SplitAggMultiPhaseWithoutGbyKey
+    Splits aggregation with DISTINCT functions (without GROUP BY keys) into three-phase
+    or four-phase plans, with optional final multi-distinct optimization.
+
+*** TwoPhaseAggregateWithDistinct
+    Legacy two-phase aggregate with distinct support.
+
+*** AggSkewRewrite
+    Rewrites aggregates to handle data skew by distributing computation across
+    multiple phases with salt-based load balancing.
+
+* Expression Rules
+  These rules operate on individual expressions (not full plan nodes). They are
+  invoked during the expression-rewrite passes on each plan node.
+
+** Constant Folding
+
+*** FoldConstantRule
+    Orchestrates constant folding by combining FE-side and BE-side evaluation to
+    reduce constant expressions to literal values at planning time.
+
+*** FoldConstantRuleOnFE
+    Evaluates constant expressions on the Frontend side (Java), replacing constant
+    sub-expressions with their computed literal values. Handles most arithmetic,
+    comparison, and simple function expressions.
+
+*** FoldConstantRuleOnBE
+    Evaluates constant expressions that require BE-side evaluation, including
+    non-deterministic and runtime functions that the FE cannot evaluate directly.
+
+** Arithmetic Simplification
+
+*** SimplifyArithmeticRule
+    Simplifies arithmetic expressions: flattens nested additions/subtractions,
+    moves constants together, eliminates identity operations.
+    Example: a + 1 + b - 2 → (a + b) - 1.
+
+*** SimplifyArithmeticComparisonRule
+    Simplifies arithmetic comparisons. Example: a + 1 > b + 1 → a > b.
+
+** Cast Simplification
+
+*** SimplifyCastRule
+    Eliminates redundant cast operations. Example: cast(cast(x as INT) as INT) → cast(x as INT).
+    Also removes casts between identical types.
+
+** Predicate Simplification
+
+*** SimplifyComparisonPredicate
+    Simplifies comparison predicates by removing redundant casts on date-type
+    expressions. Example: cast(c1 as DateV2) >= literal → c1 >= equivalent_literal.
+
+*** SimplifyConditionalFunction
+    Simplifies IF and CASE expressions: eliminates tautologies and contradictions
+    in conditional branches.
+
+*** SimplifyConflictCompound
+    Removes contradictory terms from AND/OR expressions.
+    Example: a > 10 AND a < 5 → FALSE.
+
+*** SimplifyEqualBooleanLiteral
+    Simplifies comparisons with boolean literals. Example: bool_col = TRUE → bool_col.
+    bool_col = FALSE → NOT bool_col.
+
+*** SimplifyInPredicate
+    Simplifies IN predicates by removing lossless casts on date-type expressions.
+    Example: cast(c as DateTimeV2) IN (dtv2_literal, ...) → c IN (datev2_literal, ...).
+
+*** SimplifyNotExprRule
+    Simplifies NOT expressions: eliminates double negations (NOT NOT x → x),
+    converts NOT(comparison) to the inverse comparison (NOT(a > b) → a <= b),
+    and applies De Morgan's laws (NOT(a AND b) → NOT a OR NOT b).
+
+*** SimplifyRange
+    Simplifies compound range predicates by merging overlapping ranges.
+    Example: a > 1 AND a > 2 → a > 2. a > 1 AND a < 10 → a BETWEEN 2 AND 9.
+
+*** SimplifySelfComparison
+    Detects and simplifies self-comparisons. Example: a = a → TRUE, a <> a → FALSE,
+    a >= a → TRUE.
+
+*** SimplifyTimeFieldFromUnixtime
+    Simplifies time-field extraction from unix timestamps.
+
+** Predicate Normalization
+
+*** NormalizeBinaryPredicatesRule
+    Normalizes comparisons so slots are always on the left and constants on the right.
+    Example: 5 > id → id < 5. Handles >, >=, <, <=, == operators.
+
+*** ConditionRewrite
+    Rewrites expressions in filter/condition contexts, tracking whether an expression
+    is inside a condition (AND/OR/CASE WHEN/IF) for context-aware optimizations.
+
+** Predicate Rewrite Rules
+
+*** BetweenToEqual
+    Converts BETWEEN predicates with equal upper and lower bounds to an equality
+    comparison. Example: a BETWEEN 1 AND 1 → a = 1.
+
+*** InPredicateToEqualToRule
+    Converts single-element IN predicates to equality.
+    Example: a IN (x) → a = x.
+
+*** InPredicateDedup
+    Removes duplicate values from IN lists.
+    Example: a IN (1, 2, 2, 3, 1) → a IN (1, 2, 3).
+
+*** InPredicateExtractNonConstant
+    Extracts non-constant expressions from IN predicates for separate evaluation.
+
+*** LikeToEqualRewrite
+    Rewrites LIKE patterns containing no wildcards (% or _) to equality comparisons.
+    Example: a LIKE 'hello' → a = 'hello'.
+
+*** OrToIn
+    Converts OR-connected equalities on the same column to IN predicates.
+    Example: (a=1) OR (a=2) OR (a=3) → a IN (1,2,3). Supports both replace
+    (rewrite in-place) and extract (add as new predicate) modes.
+
+*** CaseWhenToCompoundPredicate
+    Converts CASE WHEN/IF expressions with boolean literal results into simpler
+    compound predicates for better filter pushdown.
+    Example: CASE WHEN cond THEN true ELSE false END → cond.
+
+*** CaseWhenToIf
+    Converts CASE WHEN with single condition to IF function for simpler evaluation.
+
+*** NullSafeEqualToEqual
+    Converts <=> (null-safe equals) to = when columns are provably not nullable,
+    enabling more optimization opportunities.
+
+*** CondReplaceNullWithFalse
+    Replaces NULL results in condition contexts with FALSE, since conditions
+    need boolean results.
+
+*** ArrayContainToArrayOverlap
+    Converts multiple OR-connected array_contains() calls on the same array column
+    into a single arrays_overlap() call for more efficient evaluation.
+    Example: array_contains(col, 1) OR array_contains(col, 2) → arrays_overlap(col, [1,2]).
+
+*** AddMinMax
+    Adds MIN/MAX aggregation wrappers for certain expression patterns to enable
+    more efficient aggregate evaluation.
+
+** Common Factor Extraction
+
+*** ExtractCommonFactorRule
+    Extracts common factors from compound predicates using distributive laws.
+    Example: (a AND b) OR (a AND c) → a AND (b OR c). Reduces expression complexity
+    and reveals filter pushdown opportunities.
+
+*** DistinctPredicatesRule
+    Removes duplicate conjuncts/disjuncts from AND/OR expressions.
+    Example: (a=1) AND (b>2) AND (a=1) → (a=1) AND (b>2).
+
+** Date/Time Rewrites
+
+*** DateFunctionRewrite
+    Rewrites Date() function comparisons on datetime columns to direct column
+    comparisons with adjusted boundaries.
+    Example: Date(F) > '2020-01-01' → F >= '2020-01-02'.
+
+*** MergeDateTrunc
+    Merges nested DATE_TRUNC calls.
+    Example: DATE_TRUNC('day', DATE_TRUNC('hour', ts)) → DATE_TRUNC('day', ts).
+
+*** TimestampToAddTime
+    Converts TIMESTAMP arithmetic to ADD_TIME for more efficient evaluation.
+
+*** SupportJavaDateFormatter
+    Handles Java date format conversions for BE compatibility.
+
+** Type Conversions
+
+*** ConvertAggStateCast
+    Converts aggregate state casts for aggregate combinators.
+
+*** DigitalMaskingConvert
+    Converts digital masking functions for data privacy.
+
+*** LogToLn
+    Converts LOG(base, x) to LN(x) / LN(base) for more efficient computation.
+
+** Partition Pruning (Expression Level)
+   These rules work at the expression level to enable partition pruning:
+
+*** PartitionPruner
+    Main partition pruning logic: rewrites filter expressions to prune irrelevant
+    partitions by extracting partition-column predicates and intersecting them with
+    partition metadata (list/range definitions).
+
+*** PartitionPredicateToRange
+    Converts partition-related predicates into Guava RangeSet representations for
+    efficient partition range computation.
+
+*** PartitionPruneExpressionExtractor
+    Extracts partition-pruneable expressions from filter/join predicates.
+
+*** PartitionRangeExpander
+    Expands range predicates to cover all matching partitions.
+
+*** PartitionItemToRange
+    Converts individual partition definitions to range representations.
+
+*** OnePartitionEvaluator / OneListPartitionEvaluator / OneRangePartitionEvaluator
+    Evaluate filter predicates against a single partition (list or range type)
+    to determine if the partition should be included in the scan.
+
+*** UnknownPartitionEvaluator
+    Handles partitions whose range values are unknown at planning time
+    (e.g., parameterized partitions).
+
+*** PredicateRewriteForPartitionPrune
+    Rewrites predicates specifically to maximize partition pruning effectiveness.
+
+*** ColumnBound / ColumnRange / MultiColumnBound
+    Data structures representing range bounds on columns for partition analysis.
+
+*** RangeInference
+    Infers range constraints from predicates for partition pruning.
+
+*** SortedPartitionRanges / RangePartitionValueIterator
+    Sorted partition range representation and iterators for efficient scan planning.
+
+** Other Expression Rules
+
+*** ConcatWsMultiArrayToOne
+    Flattens CONCAT_WS with multiple array arguments into a single array operation.
+
+*** MedianConvert
+    Converts MEDIAN function to PERCENTILE(0.5) for unified handling.
+
+*** NestedCaseWhenCondToLiteral
+    Converts nested CASE WHEN conditions to literals when possible.
+
+*** NormalizeElementAt
+    Normalizes ELEMENT_AT function calls to standard form.
+
+*** ReplaceVariableByLiteral
+    Replaces session/global variable references with their literal values.
+
+*** RewriteDefaultExpression
+    Rewrites DEFAULT expressions in INSERT/UPDATE to their actual default values.
+
+*** StringEmptyToLengthRule
+    Converts EMPTY() or = '' checks on strings to LENGTH() = 0 for more
+    efficient evaluation.
+
+*** TrySimplifyPredicateWithMarkJoinSlot
+    Attempts to simplify predicates containing mark join slots.
+
+*** MergeGuardExpr
+    Merges guard expressions (session variable guards) for cleaner plans.
+
+*** PushIntoCaseWhenBranch
+    Pushes expressions into CASE WHEN branches for better optimization.
+
+** Expression Rewrite Infrastructure
+
+*** ExpressionRewrite
+    Main orchestrator for expression rewrites. Manages the rewrite pass over
+    all expressions in the plan.
+
+*** ExpressionNormalization / ExpressionOptimization / ExpressionNormalizationAndOptimization
+    Phased rewrite pipelines: normalization first (canonical forms), then
+    optimization (simplification, constant folding). Some passes combine both.
+
+*** AbstractExpressionRewriteRule / ExpressionRewriteRule / ExpressionRewriteContext
+    Base classes for expression rewrite rules with context passing.
+
+*** ExpressionPatternMatcher / ExpressionPatternMatchRule / ExpressionPatternRuleFactory
+    Pattern matching infrastructure for expression-level rules, analogous to
+    the plan-level pattern matcher.
+
+*** ExpressionRuleExecutor / ExpressionRuleType
+    Execution engine for applying expression rules bottom-up or top-down.
+
+*** ExpressionBottomUpRewriter / ExpressionTraverseListener
+    Traversal infrastructure for bottom-up and listener-based expression walking.
+
+*** NullableDependentExpressionRewrite
+    Special rewriter for expressions whose simplification depends on nullability
+    of their inputs.
+
+*** ExpressionMatchingContext / ExpressionMatchingAction / ExpressionListenerMatcher
+    Context and action infrastructure for expression pattern matching.
+
+*** CheckLegalityAfterRewrite / CheckCast
+    Post-rewrite validation: CheckLegalityAfterRewrite verifies expressions are valid
+    after rewriting. CheckCast validates cast operations.
+
+* Rule Sets (Pre-Built Collections)
+  RuleSet.java defines named collections used by different optimizer phases.
+
+  | Rule Set                         | Purpose                                                |
+  |----------------------------------+--------------------------------------------------------|
+  | EXPLORATION_RULES                | MergeProjectsCBO + IntersectReorder (base CBO set)     |
+  | OTHER_REORDER_RULES              | EXPLORATION + semi-join transposes + TopN pushdown     |
+  | PUSH_DOWN_FILTERS                | RBO filter/project pushdown batch (~22 rule factories) |
+  | IMPLEMENTATION_RULES             | Logical → Physical for Cascades optimizer              |
+  | DPHYPER_IMPLEMENTATION_RULES     | Logical → Physical for DPHyp (no AggregateStrategies)  |
+  | LEFT_ZIG_ZAG_TREE_JOIN_REORDER  | Join reorder when column stats unavailable             |
+  | ZIG_ZAG_TREE_JOIN_REORDER        | Zig-zag join enumeration                               |
+  | BUSHY_TREE_JOIN_REORDER          | Bushy-tree join enumeration                            |
+  | DPHYP_REORDER_RULES              | DPHyp reorder (JoinCommute.BUSHY only)                |
+  | AFTER_DPHYP_REORDER_RULES        | Post-DPHyp: project pushdown + AggStrategies + TopN    |
+  | MATERIALIZED_VIEW_IN_CBO_RULES   | MV matching for CBO (~26 MV rules)                    |
+  | MATERIALIZED_VIEW_IN_RBO_RULES   | MV matching for RBO (CBO set + extra ProjectFilterProjectJoin) |
+
+* Optimization Pipeline (Conceptual Order)
+
+  1. Analysis Phase
+     - Collect all relations (tables, views, CTEs) from the plan
+     - Bind all unresolved slots/functions/relations to catalog objects
+     - Normalize plan shapes (aggregate, sort, repeat, generate, window)
+     - Resolve aliases, fill up missing slots
+     - Normalize HAVING → Filter, QUALIFY → Filter, DISTINCT → Aggregate
+     - Unnest subqueries (SubqueryToApply → UnCorrelatedApply → ApplyToJoin)
+     - Check semantic correctness, authentication, data types
+
+  2. Pre-Rewrite Phase
+     - Expression rewrites on all plan nodes (fold constants, simplify predicates,
+       normalize binary predicates)
+     - Eliminate hints, inline views
+     - Initial column pruning
+     - CTE analysis and inline decisions
+
+  3. RBO Rewrite Batches (fixed-point loop until convergence)
+     - Batch 1: Expression rewrite on each plan node type
+     - Batch 2: Predicate pushdown (through join, project, aggregate, sort, window,
+       set-operations, generate)
+     - Batch 3: Project pushdown + column pruning + nested column pruning
+     - Batch 4: Limit/TopN pushdown (through join, window, union)
+     - Batch 5: Aggregate pushdown + count-distinct rewrite + distinct strategy
+     - Batch 6: Eliminate (sort, limit, filter, join, group-by, empty-relation, not-null,
+       unnecessary-project, join-by-UK/FK, outer-join)
+     - Batch 7: Merge (filters, projects, limits, aggregates, set-operations, topNs)
+     - Batch 8: Scan optimization (materialized index selection, partition/tablet prune,
+       virtual columns, score/vector TopN pushdown)
+     - Batch 9: Predicate inference (constant propagation, not-null inference,
+       unequal predicate inference)
+     - Batch 10: CTE rewrites (anchor pull-up, filter/limit collection, inline, re-rewrite)
+
+  4. Cost-Based Optimization (CBO)
+     - Statistics derivation on all nodes
+     - Join reorder (zig-zag, bushy, or DP-Hyper depending on table count and stats availability)
+     - Eager aggregate (group-by pushdown for cost reduction)
+     - Materialized view matching (if enabled)
+     - OR expansion (if enabled)
+
+  5. Implementation Phase
+     - Logical → Physical translation for all nodes
+     - Aggregate strategy selection:
+       - 1-phase: Simple aggregation on a single node
+       - 2-phase: Local + global aggregation for parallel execution
+       - 3-phase: For distinct aggregates with GROUP BY (2+1 or 1+2)
+       - 4-phase: For distinct aggregates without GROUP BY
+     - Storage-layer aggregate pushdown (finalize in physical scan)
+     - Physical property enforcement (distribution, ordering)
+
+  6. Post-Optimization
+     - Final plan assembly
+     - Property enforcement (exchange, sort insertion)
+     - Plan verification
